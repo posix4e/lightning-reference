@@ -1,0 +1,19 @@
+[package]
+name = "winnow-lightning-reference"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Copied beside the verified, pinned reference checkout by scripts/build-references.
+# This binary is a host fixture, never a dependency of the Swift app.
+[dependencies]
+lightning = { path = "../ldk/lightning", default-features = false, features = ["std"] }
+bitcoin = { version = "0.32.4", default-features = false, features = ["std", "secp-recovery"] }
+serde_json = "1.0"
+lightning-net-tokio = { path = "../ldk/lightning-net-tokio" }
+lightning-persister = { path = "../ldk/lightning-persister" }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std"] }
+
+[profile.dev]
+debug = 0
+incremental = false

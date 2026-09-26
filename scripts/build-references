@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Build pinned, unmodified host reference implementations and test upstream async.
+
+Nothing under this directory is an app/SwiftPM dependency. No protocol patches,
+feature overrides, validation bypasses, containers or user node data are used.
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+CLN = '6f741afc395c66d200429ea477d29df4d974748d'
+LDK = '0a2b003e7e1602df8933b15b7563ba8b6e198391'
+
+
+def run(*args, cwd=None, env=None):
+    subprocess.run(args, cwd=cwd, env=env, check=True)
+
+
+def checkout(directory, repository, commit):
+    if not directory.exists():
+        directory.mkdir(parents=True)
+        run('git', 'init', '-q', str(directory))
+        run('git', 'remote', 'add', 'origin', repository, cwd=directory)
+        run('git', 'fetch', '--depth=1', 'origin', commit, cwd=directory)
+        run('git', 'checkout', '--detach', 'FETCH_HEAD', cwd=directory)
+    actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=directory, text=True).strip()
+    if actual != commit:
+        raise SystemExit(f'Wrong reference checkout: {directory}: {actual}')
+    run('git', 'diff', '--exit-code', 'HEAD', '--', cwd=directory)
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit('usage: scripts/build-references <fresh reference build directory>')
+    directory = Path(sys.argv[1]).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    cln, ldk = directory / 'cln', directory / 'ldk'
+    checkout(cln, 'https://github.com/ElementsProject/lightning.git', CLN)
+    # Annotated release tags determine the reference daemon's --version string.
+    run('git', 'fetch', '--depth=1', 'origin', 'refs/tags/v26.06.8:refs/tags/v26.06.8', cwd=cln)
+    checkout(ldk, 'https://github.com/lightningdevkit/rust-lightning.git', LDK)
+    brew = subprocess.check_output(['brew', '--prefix'], text=True).strip()
+    environment = dict(os.environ, UV_HTTP_TIMEOUT='120', UV_NO_SYNC='1',
+        CPATH=f'{brew}/include', LIBRARY_PATH=f'{brew}/lib',
+        PKG_CONFIG_PATH=f'{brew}/opt/openssl@3/lib/pkgconfig:{brew}/opt/sqlite/lib/pkgconfig',
+        PATH=f'{cln}/.venv/bin:{brew}/opt/make/libexec/gnubin:' + os.environ['PATH'])
+    run('uv', 'sync', '--frozen', '--no-dev', cwd=cln, env=environment)
+    run('./configure', '--disable-rust', cwd=cln, env=environment)
+    run('make', '-j4', 'all-programs', cwd=cln, env=environment)
+    run('git', 'diff', '--exit-code', 'HEAD', '--', cwd=cln)
+    shutil.copyfile(ROOT / 'ldk.Cargo.lock', ldk / 'Cargo.lock')
+    rust = dict(os.environ, CARGO_BUILD_JOBS='2', CARGO_PROFILE_TEST_DEBUG='0', CARGO_INCREMENTAL='0')
+    for features, name in [(['--features', 'std'], 'std'), ([], 'controlled-clock')]:
+        with open(directory / f'ldk-async-{name}.log', 'w') as log:
+            subprocess.run(['cargo', 'test', '--locked', '-p', 'lightning', '--lib', 'async_payments_tests',
+                            '--no-default-features', *features, '--', '--test-threads=2'], cwd=ldk,
+                           env=rust, stdout=log, stderr=subprocess.STDOUT, check=True)
+        print((directory / f'ldk-async-{name}.log').read_text())
+    harness = directory / 'harness'
+    shutil.copytree(ROOT / 'harness', harness, dirs_exist_ok=True)
+    run('cargo', 'build', '--locked', cwd=harness, env=rust)
+    run('git', 'diff', '--exit-code', 'HEAD', '--', cwd=ldk)
+    manifest = {'core_lightning': {'version': 'v26.06.8', 'commit': CLN}, 'ldk': {'commit': LDK},
+                'reference_harness': {'repository': 'https://github.com/posix4e/lightning-reference',
+                    'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()},
+                'purpose': 'independent test peers only; never linked into the app',
+                'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip()}
+    (directory / 'reference-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()
