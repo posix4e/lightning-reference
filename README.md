@@ -60,3 +60,12 @@ Reference self-tests and codec checks do not establish payment settlement or
 general standards compliance. Winnow's separate interoperability scenarios
 exercise the Swift engine against these peers over real connections, including
 async hold/release, offline clients, process restarts, and timeout recovery.
+
+The host waits for Init and usability of every existing channel to a returning
+peer before replaying its saved onion-message batch. A peer without channels
+can receive the batch after Init. The batch remains on disk; one queued attempt
+is assigned per connection event, and repeated event-loop checks do not resend
+it. An unrelated unusable channel can delay replay because an opaque saved
+notification does not identify its payment's target channel. This conservative
+fixture policy is not a general-purpose liquidity-provider scheduler. The
+builder also runs the host's unfunded readiness and queue tests.

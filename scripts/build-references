@@ -63,6 +63,7 @@ def main():
     harness = directory / 'harness'
     shutil.copytree(ROOT / 'harness', harness, dirs_exist_ok=True)
     run('cargo', 'build', '--locked', cwd=harness, env=rust)
+    run('cargo', 'test', '--locked', '--bin', 'winnow-lightning-reference', cwd=harness, env=rust)
     run('git', 'diff', '--exit-code', 'HEAD', '--', cwd=ldk)
     manifest = {'core_lightning': {'version': 'v26.06.8', 'commit': CLN}, 'ldk': {'commit': LDK},
                 'reference_harness': {'repository': 'https://github.com/posix4e/lightning-reference',

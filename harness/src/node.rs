@@ -1,6 +1,8 @@
 //! Disposable regtest host for the unmodified pinned LDK. Only public APIs;
 //! funding, blocks and process control are supplied by the independent driver.
 use super::{bytes, hex, FixtureLogger};
+mod offline_replay;
+use offline_replay::{channel_replay_ready, OfflineReplayQueue};
 use bitcoin::{Network, Transaction, Block, consensus::{deserialize, serialize}, secp256k1::PublicKey};
 use lightning::chain::{self, BlockLocator, Listen, Watch, chaininterface::{BroadcasterInterface, FeeEstimator, ConfirmationTarget, TransactionType}, chainmonitor::ChainMonitor};
 use lightning::events::{Event, EventsProvider, PaymentPurpose};
@@ -43,6 +45,7 @@ impl lightning::routing::utxo::UtxoLookup for CoreOutputs {
 struct Node {
     manager: Arc<Manager>, monitor: Arc<Monitor>, messenger: Arc<Messenger>, peers: Arc<Peers>,
     store: Arc<FilesystemStore>, broadcast: Arc<Broadcast>, events: Mutex<Vec<Value>>,
+    pending_offline_replays: OfflineReplayQueue<PublicKey>,
 }
 impl Node {
     fn new(root: PathBuf, seed: u8, client: bool) -> Result<Self, String> {
@@ -90,7 +93,7 @@ impl Node {
         let gossip = Arc::new(P2PGossipSync::new(graph, Some(Arc::new(CoreOutputs(store.clone()))), logger.clone()));
         let handler = MessageHandler { chan_handler: manager.clone(), route_handler: gossip, onion_message_handler: messenger.clone(), custom_message_handler: IgnoringMessageHandler {}, send_only_message_handler: monitor.clone() };
         let peers = Arc::new(PeerManager::new(handler, now.as_secs() as u32, &keys.get_secure_random_bytes(), logger, keys));
-        Ok(Self { manager, monitor, messenger, peers, store, broadcast, events: Mutex::new(Vec::new()) })
+        Ok(Self { manager, monitor, messenger, peers, store, broadcast, events: Mutex::new(Vec::new()), pending_offline_replays: OfflineReplayQueue::new() })
     }
     fn persist(&self) { self.store.write("", "", "manager", self.manager.encode()).expect("manager persistence"); }
     fn handle(&self, event: Event) {
@@ -137,14 +140,31 @@ impl Node {
                 self.events.lock().unwrap().push(json!({"event":"offline_message", "peer":name,"count":pending.len()}));
             },
             Event::OnionMessagePeerConnected { peer_node_id } => {
-                let pending: Vec<String> = self.store.read("offline", "", &peer_node_id.to_string()).ok().map(|b| serde_json::from_slice(&b).unwrap()).unwrap_or_default();
-                for raw in pending {
-                    let raw = bytes(&json!(raw)).unwrap();
-                    let message = lightning::ln::msgs::OnionMessage::read_from_fixed_length_buffer(&mut FixedLengthReader::new(&mut raw.as_slice(), raw.len() as u64)).unwrap();
-                    if self.messenger.forward_onion_message(message, &peer_node_id).is_err() { break; }
-                }
+                self.pending_offline_replays.defer(peer_node_id);
+                self.replay_ready_offline_messages();
             },
             _ => self.events.lock().unwrap().push(json!({"event":"ldk", "detail":description})),
+        }
+    }
+    // A connected onion peer may still have an existing channel awaiting136.
+    fn offline_replay_ready(&self, peer: PublicKey) -> bool {
+        let initialized = self.peers.list_peers().iter().any(|p| p.counterparty_node_id == peer);
+        let channels = self.manager.list_channels();
+        channel_replay_ready(initialized, channels.iter().filter(|c| c.counterparty.node_id == peer).map(|c| c.is_usable))
+    }
+    fn replay_ready_offline_messages(&self) {
+        for peer in self.pending_offline_replays.take_ready(|peer| self.offline_replay_ready(peer)) {
+            self.replay_offline_messages(peer);
+        }
+    }
+    // The saved ciphertext batch stays durable and the original forwarding
+    // behavior is preserved. Timer ticks assign one attempt, not a new payment.
+    fn replay_offline_messages(&self, peer: PublicKey) {
+        let pending: Vec<String> = self.store.read("offline", "", &peer.to_string()).ok().map(|b| serde_json::from_slice(&b).unwrap()).unwrap_or_default();
+        for raw in pending {
+            let raw = bytes(&json!(raw)).unwrap();
+            let message = lightning::ln::msgs::OnionMessage::read_from_fixed_length_buffer(&mut FixedLengthReader::new(&mut raw.as_slice(), raw.len() as u64)).unwrap();
+            if self.messenger.forward_onion_message(message, &peer).is_err() { break; }
         }
     }
     async fn command(&self, input: Value) -> Result<Value, String> {
@@ -240,6 +260,7 @@ pub async fn run() -> Result<(), String> {
         let n = event_node.clone(); n.manager.process_pending_events(&|e| { n.handle(e); Ok(()) });
         n.messenger.process_pending_events(&|e| { n.handle(e); Ok(()) });
         n.monitor.process_pending_events(&|e| { n.handle(e); Ok(()) });
+        n.replay_ready_offline_messages();
         n.manager.process_pending_htlc_forwards();
         n.persist(); n.peers.process_events();
         tokio::time::sleep(Duration::from_millis(25)).await;
