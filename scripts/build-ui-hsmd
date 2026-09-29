@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Build only a labeled macOS UI HSM override; leave stock references untouched."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+CLN = '6f741afc395c66d200429ea477d29df4d974748d'
+PR_BASE = '5acb017d1fa75090c245a7361fc0a92958a84423'
+PR_HEAD = 'd03657d3ee118a96d346c6a1faaefce7dead6e1c'
+PATCH_SHA = '96560ccd5921dcc2ac0b6afcc7dce2ae190c37e9ff2714b6dde0e43ff0e0e643'
+STOCK_SOURCE_SHA = '15a8a8ceca32727cad12f9426cabfe75d9244c1f3d107f3be62cdc48b7a2eb80'
+UI_SOURCE_SHA = '29444c76b08830a393bfa49fe96d6009267fd5d53a56d6ea18ce06b4219ac68b'
+BINARY_PATHS = ('lightningd/lightningd', 'cli/lightning-cli',
+                'lightningd/lightning_channeld', 'lightningd/lightning_closingd',
+                'lightningd/lightning_connectd', 'lightningd/lightning_gossipd',
+                'lightningd/lightning_gossip_compactd', 'lightningd/lightning_hsmd',
+                'lightningd/lightning_onchaind', 'lightningd/lightning_openingd')
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            result.update(block)
+    return result.hexdigest()
+
+
+def output(args, cwd=None):
+    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+def stock_state(stock):
+    require(output(['git', 'rev-parse', 'HEAD'], stock) == CLN, 'wrong stock CLN commit')
+    subprocess.run(['git', 'diff', '--exit-code', 'HEAD', '--'], cwd=stock, check=True)
+    source = digest(stock / 'hsmd/hsmd.c')
+    require(source == STOCK_SOURCE_SHA, 'stock HSM source differs from released pin')
+    binaries = {path: digest(stock / path) for path in BINARY_PATHS}
+    return {'source_sha256': source, 'binary_sha256': binaries}
+
+
+def supplemental_probe(directory):
+    # The probe is evidence, never a gate or a retry of the Lightning journey.
+    report = directory / 'cln-ui-fd-probe.json'
+    stderr = directory / 'cln-ui-fd-probe.stderr.log'
+    argv = [sys.executable, str(ROOT / 'scripts/scm-rights-probe.py'),
+            '--iterations', '20', '--wall-seconds', '10', '--io-seconds', '0.2']
+    timed_out = False
+    with report.open('w') as out, stderr.open('w') as err:
+        try:
+            result = subprocess.run(argv, stdout=out, stderr=err, timeout=15, check=False)
+            status = result.returncode
+        except subprocess.TimeoutExpired:
+            status = None
+            timed_out = True
+    return {'path': report.name, 'sha256': digest(report),
+            'stderr_path': stderr.name, 'stderr_sha256': digest(stderr),
+            'exit_code': status, 'timed_out': timed_out,
+            'gates_build': False, 'proves_original_ci_cause': False}
+
+
+def main():
+    require(sys.platform == 'darwin', 'UI HSM override builder is macOS-only')
+    require(len(sys.argv) == 2, 'usage: scripts/build-ui-hsmd <reference build directory>')
+    directory = Path(sys.argv[1]).resolve(strict=True)
+    stock, ui = directory / 'cln', directory / 'cln-ui'
+    require(stock.is_dir() and not stock.is_symlink(), 'stock CLN must be a real directory')
+    require((stock / '.git').is_dir() and not (stock / '.git').is_symlink(),
+            'stock CLN requires independent .git directory for a safe cloned build')
+    patch = ROOT / 'patches/cln-hsmd-pr9564-d03657d.diff'
+    require(digest(patch) == PATCH_SHA, 'reviewed upstream patch hash mismatch')
+    patch_bytes = patch.read_bytes()
+    require(patch_bytes.count(b'diff --git ') == 1 and
+            b'diff --git a/hsmd/hsmd.c b/hsmd/hsmd.c\n' in patch_bytes,
+            'upstream patch must change only hsmd/hsmd.c')
+    before = stock_state(stock)
+    version = subprocess.check_output([str(stock / 'lightningd/lightningd'), '--version'],
+                                      text=True, timeout=5).strip()
+    require(version == 'v26.06.8', 'unexpected stock release version')
+    probe = supplemental_probe(directory)
+    if not ui.exists():
+        # APFS clone copies separate inodes; never fall back to hard links or
+        # editing the stock tree. Preserve mtimes for an incremental HSM build.
+        subprocess.run(['/bin/cp', '-cRp', str(stock), str(ui)], check=True)
+        subprocess.run(['git', 'apply', '--check', str(patch)], cwd=ui, check=True)
+        subprocess.run(['git', 'apply', str(patch)], cwd=ui, check=True)
+    require(ui.is_dir() and not ui.is_symlink(), 'UI CLN must be an isolated real directory')
+    require(output(['git', 'rev-parse', 'HEAD'], ui) == CLN, 'UI copy has wrong released base')
+    require(digest(ui / 'hsmd/hsmd.c') == UI_SOURCE_SHA, 'patched released HSM source hash mismatch')
+    require(output(['git', 'diff', '--name-only', 'HEAD', '--'], ui) == 'hsmd/hsmd.c',
+            'UI reference has tracked changes outside the reviewed HSM file')
+    hsm = ui / 'lightningd/lightning_hsmd'
+    require(hsm.resolve().is_relative_to(ui), 'UI HSM binary must remain within isolated copy')
+    # VERSION is a supported upstream Makefile input. Keep the release wire
+    # compatibility check active; patched status is explicit in the manifest.
+    subprocess.run(['make', '-j2', 'VERSION=' + version, 'lightningd/lightning_hsmd'], cwd=ui, check=True)
+    require(output(['git', 'diff', '--name-only', 'HEAD', '--'], ui) == 'hsmd/hsmd.c',
+            'build changed tracked files beyond the reviewed HSM source')
+    require(digest(ui / 'hsmd/hsmd.c') == UI_SOURCE_SHA, 'build changed patched HSM source bytes')
+    ui_version = subprocess.check_output([str(hsm), '--version'], text=True, timeout=5).strip()
+    require(ui_version == version, 'UI HSM and stock daemon versions differ')
+    after = stock_state(stock)
+    require(after == before, 'stock reference source/binary bytes changed')
+    ui_other_binaries = {path: digest(ui / path) for path in BINARY_PATHS
+                         if path != 'lightningd/lightning_hsmd'}
+    require(all(value == before['binary_sha256'][path]
+                for path, value in ui_other_binaries.items()),
+            'UI build changed another daemon/CLI binary')
+    manifest = {'schema_version': 1, 'role': 'macos_ui_only',
+        'observed_platform': sys.platform, 'observed_uname': list(os.uname()),
+        'stock_cln': {'commit': CLN, 'version': version, **before},
+        'stock_baseline_unchanged': True, 'stock_release_ui_claim': False,
+        'hsmd_override': {'path': str(hsm), 'sha256': digest(hsm), 'version': ui_version,
+            'source_path': str(ui / 'hsmd/hsmd.c'), 'source_sha256': UI_SOURCE_SHA,
+            'other_binary_sha256': ui_other_binaries},
+        'upstream_patch': {'pr': 9564, 'url': 'https://github.com/ElementsProject/lightning/pull/9564',
+            'base': PR_BASE, 'head': PR_HEAD, 'sha256': PATCH_SHA,
+            'released_base': CLN, 'merged': False, 'paths': ['hsmd/hsmd.c']},
+        'reference_harness': {'repository': 'https://github.com/posix4e/lightning-reference',
+            'commit': output(['git', 'rev-parse', 'HEAD'], ROOT),
+            'source_dirty': bool(output(['git', 'status', '--porcelain', '--untracked-files=no'], ROOT))},
+        'supplemental_fd_probe': probe,
+        'scope': 'Released CLN plus one reviewed upstream HSM FD-lifetime patch for macOS UI only; never linked into app.'}
+    (directory / 'cln-ui-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print('UI-only patched HSM manifest:', directory / 'cln-ui-manifest.json', flush=True)
+
+
+if __name__ == '__main__':
+    main()

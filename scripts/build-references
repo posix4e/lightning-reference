@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build pinned, unmodified host reference implementations and test upstream async.
+"""Build pinned stock host peers plus an explicitly labeled macOS UI HSM override.
 
-Nothing under this directory is an app/SwiftPM dependency. No protocol patches,
-feature overrides, validation bypasses, containers or user node data are used.
+No reference code is an app/SwiftPM dependency. Stock host gates stay unmodified;
+the separate UI HSM carries only the reviewed upstream FD-lifetime patch.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,7 @@ def main():
     run('./configure', '--disable-rust', cwd=cln, env=environment)
     run('make', '-j4', 'all-programs', cwd=cln, env=environment)
     run('git', 'diff', '--exit-code', 'HEAD', '--', cwd=cln)
+    run(sys.executable, str(ROOT / 'scripts/build-ui-hsmd'), str(directory), env=environment)
     shutil.copyfile(ROOT / 'ldk.Cargo.lock', ldk / 'Cargo.lock')
     rust = dict(os.environ, CARGO_BUILD_JOBS='2', CARGO_PROFILE_TEST_DEBUG='0', CARGO_INCREMENTAL='0')
     for features, name in [(['--features', 'std'], 'std'), ([], 'controlled-clock')]:
@@ -68,6 +70,8 @@ def main():
     manifest = {'core_lightning': {'version': 'v26.06.8', 'commit': CLN}, 'ldk': {'commit': LDK},
                 'reference_harness': {'repository': 'https://github.com/posix4e/lightning-reference',
                     'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()},
+                'ui_reference_manifest': {'path': 'cln-ui-manifest.json',
+                    'sha256': hashlib.sha256((directory / 'cln-ui-manifest.json').read_bytes()).hexdigest()},
                 'purpose': 'independent test peers only; never linked into the app',
                 'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip()}
     (directory / 'reference-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

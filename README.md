@@ -17,7 +17,7 @@ preserved in [LICENSE](LICENSE).
 - LDK: `0a2b003e7e1602df8933b15b7563ba8b6e198391`.
 - Rust toolchain: 1.89.0.
 
-The builder checks out the exact upstream revisions without protocol patches.
+The stock host peers remain at these exact upstream revisions without patches.
 It runs LDK's async-payment tests with both standard time and its controlled
 test clock, then builds the harness using the checked-in lockfiles and
 `cargo --locked`. The harness uses public LDK APIs for codec/signature checks,
@@ -69,3 +69,43 @@ it. An unrelated unusable channel can delay replay because an opaque saved
 notification does not identify its payment's target channel. This conservative
 fixture policy is not a general-purpose liquidity-provider scheduler. The
 builder also runs the host's unfunded readiness and queue tests.
+
+## Separate macOS UI HSM reference
+
+The builder also clones the already-built released CLN tree using APFS
+copy-on-write into `cln-ui/`, applies the retained single-file diff from
+[upstream PR9564](https://github.com/ElementsProject/lightning/pull/9564), and
+rebuilds only `lightningd/lightning_hsmd`. The stock `cln/` source and every
+stock daemon/CLI binary are checked before and after and remain unchanged.
+No LDK/harness source or app linkage changes. This UI peer is a **patched test
+reference**, not stock released CLN UI coverage.
+
+The reviewed diff is retained locally; no mutable PR URL is fetched at build
+time. Its PR base is `5acb017d1fa75090c245a7361fc0a92958a84423`, reviewed head
+`d03657d3ee118a96d346c6a1faaefce7dead6e1c`, and raw SHA256
+`96560ccd5921dcc2ac0b6afcc7dce2ae190c37e9ff2714b6dde0e43ff0e0e643`.
+Only `hsmd/hsmd.c` is patched on released
+`6f741afc395c66d200429ea477d29df4d974748d`; the broader upstream development
+head is not adopted. The PR was unmerged at review. The patch retains the
+sender's socket FD until lightningd has received it, addressing an upstream
+macOS SCM_RIGHTS lifetime report. The current CI log matches the reported
+request/exit sequence but lacks the actual read errno. The local harmless
+probe returned20/20 successful replies in both modes, so it did not reproduce
+the kernel issue or establish the original CI cause.
+
+`cln-ui-manifest.json` records the released base, exact PR diff, patched source
+and HSM binary hashes, observed platform, builder commit/dirty state, stock
+binary hashes, and supplemental bounded AF_UNIX probe result. The probe is
+evidence only and never permits a retry or bypasses a test gate.
+
+For UI fixtures only, `WINNOW_CLN_DIR` remains the stock `cln/` and
+`WINNOW_CLN_UI_MANIFEST` explicitly points at this manifest. The fixture must
+verify all fixed policy/hash fields and select the documented upstream
+`--subdaemon=hsmd:<absolute cln-ui/lightningd/lightning_hsmd>` override, retaining
+its manifest in `fixture/evidence/ui-cln-reference.json`. Without this explicit
+UI manifest the stock runtime is unchanged. Host interoperability gates retain
+unmodified released CLN and their original deadlines. Native/release proof
+validators must bind the additional UI manifest/source/binary rather than
+claim those runs used stock released HSM. No version-check bypass is used;
+the upstream Makefile `VERSION` input preserves the release protocol version
+while provenance explicitly identifies the modified HSM.
