@@ -2,11 +2,14 @@
 //! funding, blocks and process control are supplied by the independent driver.
 use super::{bytes, hex, FixtureLogger};
 mod offline_replay;
+mod lsps2;
 use offline_replay::{channel_replay_ready, OfflineReplayQueue};
+use lightning_liquidity::{LiquidityManagerSync, events::LiquidityEvent, lsps2::event::LSPS2ServiceEvent, utils::time::DefaultTimeProvider};
+use lightning_invoice::Bolt11Invoice;
 use bitcoin::{Network, Transaction, Block, consensus::{deserialize, serialize}, secp256k1::PublicKey};
 use lightning::chain::{self, BlockLocator, Listen, Watch, chaininterface::{BroadcasterInterface, FeeEstimator, ConfirmationTarget, TransactionType}, chainmonitor::ChainMonitor};
 use lightning::events::{Event, EventsProvider, PaymentPurpose};
-use lightning::ln::{channelmanager::{SimpleArcChannelManager, ChannelManager, ChainParameters, ChannelManagerReadArgs, PaymentId, OptionalOfferPaymentParams}, peer_handler::{MessageHandler, PeerManager, IgnoringMessageHandler}, types::ChannelId};
+use lightning::ln::{channelmanager::{SimpleArcChannelManager, ChannelManager, ChainParameters, ChannelManagerReadArgs, PaymentId, OptionalOfferPaymentParams, OptionalBolt11PaymentParams}, peer_handler::{MessageHandler, PeerManager, IgnoringMessageHandler}, types::ChannelId};
 use lightning::onion_message::messenger::{OnionMessenger, SimpleArcOnionMessenger, DefaultMessageRouter};
 use lightning::routing::{gossip::{NetworkGraph, P2PGossipSync}, router::DefaultRouter, scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters}};
 use lightning::sign::{KeysManager, InMemorySigner, EntropySource, NodeSigner};
@@ -32,7 +35,8 @@ type Monitor = ChainMonitor<InMemorySigner<Arc<FixtureLogger>>, Arc<FullBlocks>,
 type Manager = SimpleArcChannelManager<Monitor, Broadcast, Fees, FixtureLogger>;
 type Messenger = SimpleArcOnionMessenger<Monitor, Broadcast, Fees, FixtureLogger>;
 type Gossip = P2PGossipSync<Arc<NetworkGraph<Arc<FixtureLogger>>>, Arc<CoreOutputs>, Arc<FixtureLogger>>;
-type Peers = PeerManager<lightning_net_tokio::SocketDescriptor, Arc<Manager>, Arc<Gossip>, Arc<Messenger>, Arc<FixtureLogger>, IgnoringMessageHandler, Arc<Keys>, Arc<Monitor>>;
+type Liquidity = LiquidityManagerSync<Arc<Keys>, Arc<Keys>, Arc<Manager>, Arc<FilesystemStore>, DefaultTimeProvider, Arc<Broadcast>>;
+type Peers = PeerManager<lightning_net_tokio::SocketDescriptor, Arc<Manager>, Arc<Gossip>, Arc<Messenger>, Arc<FixtureLogger>, Arc<Liquidity>, Arc<Keys>, Arc<Monitor>>;
 struct CoreOutputs(Arc<FilesystemStore>);
 impl lightning::routing::utxo::UtxoLookup for CoreOutputs {
     fn get_utxo(&self, chain: &bitcoin::constants::ChainHash, scid: u64, _: Arc<lightning::util::wakers::Notifier>) -> lightning::routing::utxo::UtxoResult {
@@ -46,9 +50,13 @@ struct Node {
     manager: Arc<Manager>, monitor: Arc<Monitor>, messenger: Arc<Messenger>, peers: Arc<Peers>,
     store: Arc<FilesystemStore>, broadcast: Arc<Broadcast>, events: Mutex<Vec<Value>>,
     pending_offline_replays: OfflineReplayQueue<PublicKey>,
+    /// Stock LDK's LSPS service; it answers only in the `lsps2` role.
+    liquidity: Arc<Liquidity>, lsps2: Option<lsps2::Options>,
 }
 impl Node {
-    fn new(root: PathBuf, seed: u8, client: bool) -> Result<Self, String> {
+    fn new(root: PathBuf, seed: u8, role: &str) -> Result<Self, String> {
+        let client = role == "client";
+        let lsps2 = (role == "lsps2").then(lsps2::Options::from_env);
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let logger = Arc::new(FixtureLogger);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -70,6 +78,7 @@ impl Node {
         config.channel_config.forwarding_fee_base_msat = 1000;
         config.channel_config.forwarding_fee_proportional_millionths = 0;
         config.channel_config.cltv_expiry_delta = 48;
+        if let Some(options) = &lsps2 { lsps2::node_config(&mut config, options); }
         let monitors = read_channel_monitors(store.clone(), keys.clone(), keys.clone()).map_err(|e| e.to_string())?;
         let manager = match store.read("", "", "manager") {
             Ok(raw) => {
@@ -91,15 +100,69 @@ impl Node {
         // Funding outputs are populated exclusively from Bitcoin Core's mined
         // blocks; LDK verifies gossip signatures and the real funding scripts.
         let gossip = Arc::new(P2PGossipSync::new(graph, Some(Arc::new(CoreOutputs(store.clone()))), logger.clone()));
-        let handler = MessageHandler { chan_handler: manager.clone(), route_handler: gossip, onion_message_handler: messenger.clone(), custom_message_handler: IgnoringMessageHandler {}, send_only_message_handler: monitor.clone() };
+        let liquidity = Arc::new(Liquidity::new(keys.clone(), keys.clone(), manager.clone(), store.clone(), broadcast.clone(),
+            lsps2.map(|_| lsps2::service_config()), None).map_err(|e| format!("liquidity: {e:?}"))?);
+        let handler = MessageHandler { chan_handler: manager.clone(), route_handler: gossip, onion_message_handler: messenger.clone(), custom_message_handler: liquidity.clone(), send_only_message_handler: monitor.clone() };
         let peers = Arc::new(PeerManager::new(handler, now.as_secs() as u32, &keys.get_secure_random_bytes(), logger, keys));
-        Ok(Self { manager, monitor, messenger, peers, store, broadcast, events: Mutex::new(Vec::new()), pending_offline_replays: OfflineReplayQueue::new() })
+        Ok(Self { manager, monitor, messenger, peers, store, broadcast, events: Mutex::new(Vec::new()), pending_offline_replays: OfflineReplayQueue::new(),
+                  liquidity, lsps2 })
+    }
+    /// The client's LSPS2 requests: fee terms, a purchase, then a channel once
+    /// an intercepted payment covers the purchase.
+    fn handle_liquidity(&self, event: LiquidityEvent) {
+        let (Some(options), Some(service)) = (self.lsps2, self.liquidity.lsps2_service_handler()) else { return };
+        match event {
+            LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::GetInfo { request_id, counterparty_node_id, .. }) => {
+                service.opening_fee_params_generated(&counterparty_node_id, request_id, vec![lsps2::fee_params()]).expect("fee terms");
+            },
+            LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::BuyRequest { request_id, counterparty_node_id, payment_size_msat, .. }) => {
+                let scid = self.manager.get_intercept_scid();
+                let user_channel_id = u128::from(scid);
+                service.invoice_parameters_generated(&counterparty_node_id, request_id, scid, lsps2::CLTV_EXPIRY_DELTA,
+                    options.client_trusts_lsp, user_channel_id).expect("invoice parameters");
+                self.events.lock().unwrap().push(json!({"event":"lsps2_buy", "scid":scid, "payment_size_msat":payment_size_msat}));
+            },
+            LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel { their_network_key, amt_to_forward_msat, opening_fee_msat, user_channel_id, .. }) => {
+                // Persisted and replayed after restart: open at most once.
+                if self.manager.list_channels().iter().any(|c| c.user_channel_id == user_channel_id) { return; }
+                let sats = options.channel_sats(amt_to_forward_msat);
+                let config = Some(options.channel_config());
+                let opened = if options.zero_reserve {
+                    self.manager.create_channel_to_trusted_peer_0reserve(their_network_key, sats, 0, user_channel_id, None, config)
+                } else {
+                    self.manager.create_channel(their_network_key, sats, 0, user_channel_id, None, config)
+                };
+                opened.expect("JIT channel");
+                self.events.lock().unwrap().push(json!({"event":"lsps2_open", "amount":sats, "forward_msat":amt_to_forward_msat, "fee_msat":opening_fee_msat}));
+            },
+            _ => {},
+        }
+    }
+    /// LDK events the LSPS2 service tracks; other roles ignore them here.
+    fn lsps2_event(&self, event: &Event) {
+        let (Some(_), Some(service)) = (self.lsps2, self.liquidity.lsps2_service_handler()) else { return };
+        let _ = match event {
+            Event::HTLCIntercepted { intercept_id, requested_next_hop_scid, payment_hash, expected_outbound_amount_msat, .. } =>
+                service.htlc_intercepted(*requested_next_hop_scid, *intercept_id, *expected_outbound_amount_msat, *payment_hash),
+            Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id, .. } =>
+                service.channel_ready(*user_channel_id, channel_id, counterparty_node_id),
+            Event::FundingTxBroadcastSafe { user_channel_id, counterparty_node_id, .. } =>
+                service.set_funding_tx_broadcast_safe(*user_channel_id, counterparty_node_id),
+            Event::HTLCHandlingFailed { failure_type, .. } => service.htlc_handling_failed(failure_type.clone()),
+            Event::PaymentForwarded { next_htlcs, skimmed_fee_msat, .. } => match next_htlcs.first() {
+                Some(next) => service.payment_forwarded(next.channel_id, skimmed_fee_msat.unwrap_or(0)),
+                None => Ok(()),
+            },
+            Event::ChannelClosed { channel_id, .. } => service.channel_closed(*channel_id),
+            _ => Ok(()),
+        };
     }
     fn persist(&self) { self.store.write("", "", "manager", self.manager.encode()).expect("manager persistence"); }
     fn handle(&self, event: Event) {
         let description = format!("{event:?}");
+        self.lsps2_event(&event);
         match event {
-            Event::FundingGenerationReady { temporary_channel_id, counterparty_node_id, channel_value_satoshis, output_script, .. } => self.events.lock().unwrap().push(json!({"event":"funding", "temporary_id":hex(&temporary_channel_id.0),"peer":counterparty_node_id.to_string(),"amount":channel_value_satoshis,"script":hex(output_script.as_bytes())})),
+            Event::FundingGenerationReady { temporary_channel_id, counterparty_node_id, channel_value_satoshis, output_script, user_channel_id, .. } => self.events.lock().unwrap().push(json!({"event":"funding", "temporary_id":hex(&temporary_channel_id.0),"peer":counterparty_node_id.to_string(),"amount":channel_value_satoshis,"script":hex(output_script.as_bytes()),"user_channel_id":user_channel_id.to_string()})),
             Event::OpenChannelRequest { temporary_channel_id, counterparty_node_id, .. } => {
                 self.manager.accept_inbound_channel(&temporary_channel_id, &counterparty_node_id, 1, None).expect("accept inbound");
             },
@@ -206,9 +269,22 @@ impl Node {
             Some("fund") => {
                 let id = ChannelId::from_bytes(bytes(&input["id"])?.try_into().map_err(|_| "channel id")?);
                 let peer = PublicKey::from_str(input["peer"].as_str().ok_or("peer")?).map_err(|e| e.to_string())?;
-                let tx = deserialize(&bytes(&input["transaction"])?).map_err(|e| e.to_string())?;
-                self.manager.funding_transaction_generated(id, peer, tx).map_err(|e| format!("{e:?}"))?;
-                Ok(json!({"funding":true}))
+                let tx: Transaction = deserialize(&bytes(&input["transaction"])?).map_err(|e| e.to_string())?;
+                // A JIT channel the client trusts us for is published only
+                // after the client claims its payment (bLIP-52).
+                let user_channel_id = self.manager.list_channels().iter().find(|c| c.channel_id == id).map(|c| c.user_channel_id);
+                let service = self.liquidity.lsps2_service_handler();
+                let manual = match (&service, user_channel_id) {
+                    (Some(service), Some(user)) => service.channel_needs_manual_broadcast(user, &peer).unwrap_or(false),
+                    _ => false,
+                };
+                if let (true, Some(service), Some(user)) = (manual, &service, user_channel_id) {
+                    service.store_funding_transaction(user, &peer, tx.clone()).map_err(|e| format!("{e:?}"))?;
+                    self.manager.funding_transaction_generated_manual_broadcast(id, peer, tx).map_err(|e| format!("{e:?}"))?;
+                } else {
+                    self.manager.funding_transaction_generated(id, peer, tx).map_err(|e| format!("{e:?}"))?;
+                }
+                Ok(json!({"funding":true, "manual_broadcast":manual}))
             },
             Some("block") => {
                 let block: Block = deserialize(&bytes(&input["hex"])?).map_err(|e| e.to_string())?;
@@ -242,6 +318,12 @@ impl Node {
                 self.manager.pay_for_offer(&offer, input["amount"].as_u64(), id, OptionalOfferPaymentParams::default()).map_err(|e| format!("{e:?}"))?;
                 Ok(json!({"paying":true}))
             },
+            Some("pay_invoice") => {
+                let invoice: Bolt11Invoice = input["invoice"].as_str().ok_or("invoice")?.parse().map_err(|e| format!("{e:?}"))?;
+                let id = PaymentId(invoice.payment_hash().0);
+                self.manager.pay_for_bolt11_invoice(&invoice, id, None, OptionalBolt11PaymentParams::default()).map_err(|e| format!("{e:?}"))?;
+                Ok(json!({"paying":true, "hash":hex(&invoice.payment_hash().0)}))
+            },
             Some("events") => Ok(json!({"events":std::mem::take(&mut *self.events.lock().unwrap()), "broadcasts":std::mem::take(&mut *self.broadcast.0.lock().unwrap()).iter().map(|tx| hex(&serialize(tx))).collect::<Vec<_>>()})),
             _ => Err("unknown node command".into()),
         }
@@ -249,8 +331,10 @@ impl Node {
 }
 pub async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 { return Err("node DIRECTORY SEED client|provider".into()); }
-    let node = Arc::new(Node::new(PathBuf::from(&args[2]), args[3].parse().map_err(|_| "seed")?, args[4] == "client")?);
+    if args.len() != 5 || !["client", "provider", "lsps2"].contains(&args[4].as_str()) {
+        return Err("node DIRECTORY SEED client|provider|lsps2".into());
+    }
+    let node = Arc::new(Node::new(PathBuf::from(&args[2]), args[3].parse().map_err(|_| "seed")?, &args[4])?);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     println!("{}", json!({"ok":true,"node":node.manager.get_our_node_id().to_string(),"port":listener.local_addr().unwrap().port()}));
     let listen_node = node.clone();
@@ -260,6 +344,7 @@ pub async fn run() -> Result<(), String> {
         let n = event_node.clone(); n.manager.process_pending_events(&|e| { n.handle(e); Ok(()) });
         n.messenger.process_pending_events(&|e| { n.handle(e); Ok(()) });
         n.monitor.process_pending_events(&|e| { n.handle(e); Ok(()) });
+        for event in n.liquidity.get_and_clear_pending_events() { n.handle_liquidity(event); }
         n.replay_ready_offline_messages();
         n.manager.process_pending_htlc_forwards();
         n.persist(); n.peers.process_events();

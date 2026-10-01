@@ -12,6 +12,8 @@ bitcoin = { version = "0.32.4", default-features = false, features = ["std", "se
 serde_json = "1.0"
 lightning-net-tokio = { path = "../ldk/lightning-net-tokio" }
 lightning-persister = { path = "../ldk/lightning-persister" }
+lightning-liquidity = { path = "../ldk/lightning-liquidity" }
+lightning-invoice = { path = "../ldk/lightning-invoice" }
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std"] }
 
 [profile.dev]
